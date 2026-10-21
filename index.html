@@ -536,7 +536,7 @@ document.addEventListener('visibilitychange', () => { if (document.hidden && doc
 async function openNote(id) {
   note = items.get(id); if (!note) return;
   let d = null; try { d = await DB.get('docs', id); } catch (e) {}
-  doc = d || { id, bg: 'lines', strokes: [], imgs: [] };
+  doc = d || { id, bg: 'grid', strokes: [], imgs: [] };
   doc.strokes = doc.strokes || []; doc.imgs = doc.imgs || [];
   undoS = []; redoS = []; sel = null; g = null; changed = false;
   $('lib').hidden = true; $('ed').hidden = false;
@@ -1620,12 +1620,7 @@ async function exportDialog() {
   if (r.k !== 'ok') return;
   const name = (r.el.querySelector('#dlgName').value.trim() || note.name).replace(/[\\/:*?"<>|]+/g, '-').replace(/[.\s]+$/, '') || 'Notiz';
   const withBg = r.el.querySelector('#withBg').checked;
-  let handle = null;
-  if (window.showSaveFilePicker) {
-    try { handle = await window.showSaveFilePicker({ suggestedName: name + '.pdf', types: [{ description: 'PDF-Dokument', accept: { 'application/pdf': ['.pdf'] } }] }); }
-    catch (err) { if (err && err.name === 'AbortError') { toast('Export abgebrochen'); return; } handle = null; }
-  }
-  doExport(name, withBg, handle);
+  doExport(name, withBg, null);
 }
 async function doExport(name, withBg, handle) {
   busy('PDF wird erstellt …');
@@ -1758,7 +1753,32 @@ async function boot() {
   }
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
   renderLib();
-  if (STANDALONE && 'serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('./sw.js').catch(() => {});
+  if (STANDALONE && 'serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('./sw.js').catch(() => {});
+  if (STANDALONE && new URLSearchParams(location.search).has('share')) { history.replaceState(null, '', location.pathname); handleShared(); }
+}
+/* Dateien, die aus einer anderen App (z. B. Proton Drive) an Stiftblock geteilt wurden */
+async function handleShared() {
+  const files = [];
+  try {
+    const c = await caches.open('stiftblock-share');
+    for (const req of await c.keys()) {
+      const r = await c.match(req); const b = await r.blob();
+      files.push(new File([b], decodeURIComponent(r.headers.get('X-Name') || 'Datei'), { type: b.type }));
+      await c.delete(req);
+    }
+  } catch (e) {}
+  const ok = files.filter(f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name) || f.type.startsWith('image/'));
+  if (!ok.length) { toast('Es kam keine PDF und kein Bild an.'); return; }
+  const notes = [...items.values()].filter(i => i.kind === 'note').sort((a, b) => b.updated - a.updated).slice(0, 40);
+  const r = await dialog({ title: ok.length === 1 ? `„${ok[0].name}“ einfügen in …` : `${ok.length} Dateien einfügen in …`,
+    body: `<div class="flist">${notes.map(n => `<button type="button" data-k="n:${n.id}"><i style="--c:var(--accent)"></i>${esc(n.name)}</button>`).join('') || '<p>Noch keine Notizen vorhanden.</p>'}</div>`,
+    buttons: [{ k: 'cancel', label: 'Abbrechen' }, { k: 'new', label: 'Neue Notiz', pri: 1 }] });
+  if (r.k === 'cancel') return;
+  let id;
+  if (r.k === 'new') { const it = await mkItem('note', ok[0].name.replace(/\.[^.]+$/, '') || 'Neue Notiz', cwd); id = it.id; }
+  else id = r.k.slice(2);
+  await openNote(id);
+  for (const f of ok) { if (f.type === 'application/pdf' || /\.pdf$/i.test(f.name)) await addPdf(f); else await addImage(f); }
 }
 boot();
 })();
