@@ -1,5 +1,5 @@
 /* Stiftblock Offline-Speicher. Bei einem Update die Versionsnummer erhöhen. */
-const CACHE = 'stiftblock-v3';
+const CACHE = 'stiftblock-v4';
 const SHARE = 'stiftblock-share';
 const CORE = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './icon-maskable-512.png',
   './pdf.min.js', './pdf.worker.min.js', './jspdf.umd.min.js'];

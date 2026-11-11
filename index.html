@@ -1967,7 +1967,7 @@ DB.del = (s, id) => {
 let syState = 'idle', syMsg = '', syT = null, syBusy = null;
 const cloudSvg = '<svg viewBox="0 0 24 24"><path d="M7 18a4.5 4.5 0 01-.6-8.96A6 6 0 0118 8.5a4 4 0 01-.5 9.5z"/></svg>';
 function syDot() { return !syncOn() ? '#e08a00' : syState === 'err' ? 'var(--danger)' : syState === 'sync' ? 'var(--accent)' : '#1f8a4c'; }
-function syLabel() { return !syncOn() ? 'Nicht gesichert' : syState === 'err' ? 'Fehler' : syState === 'sync' ? 'Sichere …' : 'Gesichert'; }
+function syLabel() { return !syncOn() ? 'Nicht gesichert' : syState === 'err' ? 'Fehler' : syState === 'sync' ? (syMsg ? 'Sichere ' + syMsg : 'Sichere …') : 'Gesichert'; }
 function setSy(s, m) {
   syState = s; syMsg = m || '';
   const b = $('syBtn'); if (b) b.innerHTML = `<span class="sydot" style="--c:${syDot()}">${cloudSvg}</span>${syLabel()}`;
@@ -1977,7 +1977,7 @@ function agoTxt(t) { const s = (Date.now() - t) / 1000; if (s < 60) return 'gera
 function syStatusHtml() {
   if (!syncOn()) return '<b style="color:#e08a00">Nicht eingerichtet – deine Notizen liegen nur auf diesem Gerät.</b>';
   if (syState === 'err') return `<b style="color:var(--danger)">⚠ ${esc(syMsg)}</b>`;
-  if (syState === 'sync') return '<b style="color:var(--accent)">Synchronisiere …</b>';
+  if (syState === 'sync') return `<b style="color:var(--accent)">Synchronisiere … ${esc(syMsg)}</b>`;
   return `<b style="color:#1f8a4c">✓ Gesichert${SY.last ? ' · ' + agoTxt(SY.last) : ''}</b>`;
 }
 
@@ -1986,9 +1986,12 @@ function b64enc(str) { const b = new TextEncoder().encode(str); let s = ''; for 
 function b64dec(b64) { const bin = atob(b64.replace(/\s/g, '')); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return new TextDecoder().decode(u); }
 async function gh(path, opt = {}) {
   const base = `https://api.github.com/repos/${encodeURIComponent(SY.owner)}/${encodeURIComponent(SY.repo)}`;
-  return fetch(base + (path ? '/contents/' + path : ''), { method: opt.method || 'GET', cache: 'no-store', body: opt.body,
+  const ac = new AbortController(), to = setTimeout(() => ac.abort(), opt.body ? 120000 : 45000);
+  return fetch(base + (path ? '/contents/' + path : ''), { method: opt.method || 'GET', cache: 'no-store', body: opt.body, signal: ac.signal,
     headers: { Authorization: 'Bearer ' + SY.token, Accept: opt.raw ? 'application/vnd.github.raw+json' : 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28', ...(opt.body ? { 'Content-Type': 'application/json' } : {}) } });
+      'X-GitHub-Api-Version': '2022-11-28', ...(opt.body ? { 'Content-Type': 'application/json' } : {}) } })
+    .catch(e => { throw new Error(e.name === 'AbortError' ? 'Zeitüberschreitung – Verbindung zu langsam, versuche es gleich erneut' : 'Keine Verbindung zu GitHub'); })
+    .finally(() => clearTimeout(to));
 }
 function ghErr(r) {
   return r.status === 401 ? 'Schlüssel ungültig oder abgelaufen – bitte neu eintragen'
@@ -2009,9 +2012,14 @@ async function putFile(path, b64, sha, msg) {
     if (sha) body.sha = sha;
     const r = await gh(path, { method: 'PUT', body: JSON.stringify(body) });
     if (r.ok) return (await r.json()).content.sha;
-    if ((r.status === 409 || r.status === 422) && a === 0) { sha = await shaOf(path); continue; }
+    if ((r.status === 409 || r.status === 422) && a === 0) { sha = await shaOf(path); if (sha && sha === await gitSha(b64)) return sha; continue; } // schon vorhanden (z. B. nach Abbruch) → nicht doppelt hochladen
     throw new Error(ghErr(r));
   }
+}
+async function gitSha(b64) { // Git-Prüfsumme einer Datei, um gleiche Dateien zu erkennen
+  const bin = atob(b64), head = new TextEncoder().encode(`blob ${bin.length}\0`), u = new Uint8Array(head.length + bin.length);
+  u.set(head); for (let i = 0; i < bin.length; i++) u[head.length + i] = bin.charCodeAt(i);
+  return [...new Uint8Array(await crypto.subtle.digest('SHA-1', u))].map(x => x.toString(16).padStart(2, '0')).join('');
 }
 async function delFile(path, sha) {
   if (!sha) sha = await shaOf(path); if (!sha) return;
@@ -2036,15 +2044,28 @@ async function syncNow(opt = {}) {
     try {
       let libChanged = false;
       for (let attempt = 0; attempt < 3; attempt++) {
-        const got = await getText(MANI);
+        const got = await getText(MANI); let msha = got ? got.sha : null, sinceSave = 0, done = 0;
+        const saveMani = async () => {
+          m.saved = Date.now(); m.device = DEVICE;
+          const body = { message: `Stiftblock-Sync ${new Date().toLocaleString('de-DE')} (${DEVICE})`, content: b64enc(JSON.stringify(m)) };
+          if (msha) body.sha = msha;
+          const r = await gh(MANI, { method: 'PUT', body: JSON.stringify(body) });
+          if (r.status === 409 || r.status === 422) return false;
+          if (!r.ok) throw new Error(ghErr(r));
+          msha = (await r.json()).content.sha; sinceSave = 0; mChanged = false; return true;
+        };
         const m = got ? JSON.parse(got.text) : { app: 'stiftblock-sync', v: 1, items: {}, docs: {}, blobs: {}, dead: {} };
         for (const t of ['items', 'docs', 'blobs', 'dead']) m[t] = m[t] || {};
         let mChanged = !got;
         const openId = edOpen() && note ? note.id : null;
         const keys = new Set([...Object.keys(SY.ver), ...Object.keys(SY.dead), ...Object.keys(m.dead)]);
         for (const [t, tbl] of [['i', m.items], ['d', m.docs], ['b', m.blobs]]) for (const id in tbl) keys.add(t + ':' + id);
-        for (const k of keys) {
+        const todo = [...keys].filter(k => { const t = k[0], id = k.slice(2), tb = m[STORE[t]]; if (!tb) return false;
+          return Math.max(tb[id] ? tb[id].t || 0 : 0, m.dead[k] || 0) !== Math.max(SY.ver[k] || 0, SY.dead[k] || 0); });
+        let conflict = false;
+        for (const k of todo) {
           const t = k[0], id = k.slice(2), store = STORE[t], rtbl = m[store];
+          if (todo.length > 3) setSy('sync', `${++done}/${todo.length}`);
           if (!store) continue;
           const rv = rtbl[id] ? rtbl[id].t || 0 : 0, rd = m.dead[k] || 0, lv = SY.ver[k] || 0, ld = SY.dead[k] || 0;
           const rT = Math.max(rv, rd), lT = Math.max(lv, ld);
@@ -2074,23 +2095,18 @@ async function syncNow(opt = {}) {
               else { const du = await blobToDataUrl(val.blob); rtbl[id] = { t: lv, type: val.blob.type, sha: await putFile(`blobs/${id}`, du.slice(du.indexOf(',') + 1), rtbl[id] && rtbl[id].sha, 'Stiftblock: Bild') }; }
               delete m.dead[k]; mChanged = true;
             }
+            if (++sinceSave >= 10) { if (!await saveMani()) { conflict = true; break; } }
           }
           sySave();
         }
-        if (mChanged) {
-          m.saved = Date.now(); m.device = DEVICE;
-          const body = { message: `Stiftblock-Sync ${new Date().toLocaleString('de-DE')} (${DEVICE})`, content: b64enc(JSON.stringify(m)) };
-          if (got) body.sha = got.sha;
-          const r = await gh(MANI, { method: 'PUT', body: JSON.stringify(body) });
-          if (r.status === 409 || r.status === 422) continue; // inzwischen anderes Gerät → neu holen & abgleichen
-          if (!r.ok) throw new Error(ghErr(r));
-        }
+        if (conflict) continue;
+        if (mChanged) { if (!await saveMani()) continue; } // inzwischen anderes Gerät → neu holen & abgleichen
         break;
       }
       SY.last = Date.now(); sySave();
       if (libChanged && !edOpen()) renderLib();
       setSy('ok'); return true;
-    } catch (e) { setSy('err', e.message || 'Keine Verbindung'); return false; }
+    } catch (e) { setSy('err', e.message || 'Keine Verbindung'); clearTimeout(syT); syT = setTimeout(() => syncNow(), 60000); return false; }
     finally { syBusy = null; }
   })();
   return syBusy;
