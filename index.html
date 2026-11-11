@@ -67,6 +67,7 @@ button{font-family:var(--ui)}
   background:var(--chrome);color:var(--fg);display:grid;place-items:center;cursor:pointer;padding:0}
 .more svg{width:18px;height:18px;fill:currentColor}
 .empty{grid-column:1/-1;padding:40px 16px;text-align:center;color:var(--muted);font-size:15px;line-height:1.5;border:1.5px dashed var(--line);border-radius:14px}
+.sydot{position:relative;display:inline-grid;place-items:center}.sydot::after{content:'';position:absolute;right:-3px;bottom:0;width:8px;height:8px;border-radius:50%;background:var(--c);box-shadow:0 0 0 2px var(--card)}
 .libnote{color:var(--muted);font-size:13px;line-height:1.5;max-width:65ch}
 
 /* ---------- Buttons, Menüs, Dialoge ---------- */
@@ -198,6 +199,7 @@ select.bg{flex:none;height:36px;border-radius:9px;border:1px solid var(--line);b
         Stiftblock
       </div>
       <div class="libact">
+        <button class="btn" id="syBtn" title="Automatische Sicherung über GitHub"></button>
         <button class="btn" id="bkBtn"><svg viewBox="0 0 24 24"><path d="M4 7a2 2 0 012-2h9l5 5v8a2 2 0 01-2 2H6a2 2 0 01-2-2z"/><path d="M8 5v5h7V5M8 20v-5h8v5"/></svg>Sicherung</button>
         <button class="btn" id="newFolder"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><path d="M12 10v6M9 13h6"/></svg>Neuer Ordner</button>
         <button class="btn pri" id="newNote"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Neue Notiz</button>
@@ -205,7 +207,7 @@ select.bg{flex:none;height:36px;border-radius:9px;border:1px solid var(--line);b
     </header>
     <nav class="crumbs" id="crumbs" aria-label="Ordnerpfad"></nav>
     <div class="grid" id="grid"></div>
-    <p class="libnote">Deine Notizen werden in diesem Browser auf diesem Gerät gespeichert. Sichere wichtige Notizen als PDF, zum Beispiel in deinem Proton Drive.</p>
+    <p class="libnote">Deine Notizen werden auf diesem Gerät gespeichert und – wenn eingerichtet – automatisch in deinem privaten GitHub-Repository gesichert (Wolken-Knopf oben).</p>
   </div>
 </section>
 
@@ -591,6 +593,7 @@ async function closeNote() {
   if (changed) { try { note.thumb = makeThumb(); await DB.put('items', note); } catch (e) {} }
   doc = null; sel = null; st.ruler = false;
   $('ed').hidden = true; $('lib').hidden = false; cwd = note.parent || null; renderLib();
+  if (syncOn()) setTimeout(() => syncNow({ quiet: true }), 800);
 }
 
 /* ================= Bilder-Cache ================= */
@@ -1934,6 +1937,249 @@ $('bkBtn').onclick = () => popMenu($('bkBtn'), [
 ]);
 $('fBk').onchange = e => { const f = e.target.files[0]; if (f) importBackup(f); e.target.value = ''; };
 
+/* ================= Automatische Sicherung über GitHub (privates Repository) ================= */
+/* Aufbau im Repository:
+   stiftblock.json  – Verzeichnis: Ordner/Notizen (mit Vorschaubild), Versionen, gelöschte Einträge
+   docs/<id>.json   – Inhalt einer Notiz (Striche, Bildpositionen)
+   blobs/<id>       – eingefügte Bilder/PDF-Seiten
+   Jede Änderung wird nach ca. 15 s hochgeladen; beim Öffnen wird der neueste Stand geholt.
+   Gewinnt jeweils die neuere Version eines Eintrags, Löschungen werden mit übertragen. */
+const SYK = 'stiftblock.sync', MANI = 'stiftblock.json';
+let SY = {}; try { SY = JSON.parse(localStorage.getItem(SYK)) || {}; } catch (e) {}
+SY.ver = SY.ver || {}; SY.dead = SY.dead || {};
+function sySave() { try { localStorage.setItem(SYK, JSON.stringify(SY)); } catch (e) {} }
+const syncOn = () => !!(SY.owner && SY.repo && SY.token);
+const SKEY = { items: 'i', docs: 'd', blobs: 'b' }, STORE = { i: 'items', d: 'docs', b: 'blobs' };
+const DEVICE = /Android|Tablet|iPad/i.test(navigator.userAgent) ? 'Tablet' : /iPhone/i.test(navigator.userAgent) ? 'iPhone' : 'PC';
+
+/* Jede Speicherung merkt sich, was sich geändert hat */
+const DB0 = { get: DB.get, all: DB.all, keys: DB.keys, put: DB.put, del: DB.del };
+DB.put = (s, v) => {
+  if (v && v.id && v.id !== '__meta' && SKEY[s]) { const k = SKEY[s] + ':' + v.id; SY.ver[k] = Math.max(Date.now(), (SY.ver[k] || 0) + 1); delete SY.dead[k]; sySave(); syncSchedule(); }
+  return DB0.put(s, v);
+};
+DB.del = (s, id) => {
+  if (id && id !== '__meta' && SKEY[s]) { const k = SKEY[s] + ':' + id; SY.dead[k] = Math.max(Date.now(), (SY.ver[k] || 0) + 1); delete SY.ver[k]; sySave(); syncSchedule(); }
+  return DB0.del(s, id);
+};
+
+/* ---- Status ---- */
+let syState = 'idle', syMsg = '', syT = null, syBusy = null;
+const cloudSvg = '<svg viewBox="0 0 24 24"><path d="M7 18a4.5 4.5 0 01-.6-8.96A6 6 0 0118 8.5a4 4 0 01-.5 9.5z"/></svg>';
+function syDot() { return !syncOn() ? '#e08a00' : syState === 'err' ? 'var(--danger)' : syState === 'sync' ? 'var(--accent)' : '#1f8a4c'; }
+function syLabel() { return !syncOn() ? 'Nicht gesichert' : syState === 'err' ? 'Fehler' : syState === 'sync' ? 'Sichere …' : 'Gesichert'; }
+function setSy(s, m) {
+  syState = s; syMsg = m || '';
+  const b = $('syBtn'); if (b) b.innerHTML = `<span class="sydot" style="--c:${syDot()}">${cloudSvg}</span>${syLabel()}`;
+  const st2 = document.getElementById('syStatus'); if (st2) st2.innerHTML = syStatusHtml();
+}
+function agoTxt(t) { const s = (Date.now() - t) / 1000; if (s < 60) return 'gerade eben'; if (s < 3600) return `vor ${Math.round(s / 60)} min`; if (s < 86400) return `vor ${Math.round(s / 3600)} h`; return new Date(t).toLocaleString('de-DE'); }
+function syStatusHtml() {
+  if (!syncOn()) return '<b style="color:#e08a00">Nicht eingerichtet – deine Notizen liegen nur auf diesem Gerät.</b>';
+  if (syState === 'err') return `<b style="color:var(--danger)">⚠ ${esc(syMsg)}</b>`;
+  if (syState === 'sync') return '<b style="color:var(--accent)">Synchronisiere …</b>';
+  return `<b style="color:#1f8a4c">✓ Gesichert${SY.last ? ' · ' + agoTxt(SY.last) : ''}</b>`;
+}
+
+/* ---- GitHub-API ---- */
+function b64enc(str) { const b = new TextEncoder().encode(str); let s = ''; for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); }
+function b64dec(b64) { const bin = atob(b64.replace(/\s/g, '')); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return new TextDecoder().decode(u); }
+async function gh(path, opt = {}) {
+  const base = `https://api.github.com/repos/${encodeURIComponent(SY.owner)}/${encodeURIComponent(SY.repo)}`;
+  return fetch(base + (path ? '/contents/' + path : ''), { method: opt.method || 'GET', cache: 'no-store', body: opt.body,
+    headers: { Authorization: 'Bearer ' + SY.token, Accept: opt.raw ? 'application/vnd.github.raw+json' : 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28', ...(opt.body ? { 'Content-Type': 'application/json' } : {}) } });
+}
+function ghErr(r) {
+  return r.status === 401 ? 'Schlüssel ungültig oder abgelaufen – bitte neu eintragen'
+    : r.status === 403 ? 'Keine Berechtigung (Schlüssel braucht „Contents: Read and write“ für dieses Repository)'
+    : r.status === 404 ? 'Repository nicht gefunden – Name/Benutzer prüfen' : 'GitHub-Fehler ' + r.status;
+}
+async function getText(path) { // → {sha, text} oder null
+  const r = await gh(path); if (r.status === 404) return null; if (!r.ok) throw new Error(ghErr(r));
+  const j = await r.json();
+  if (j.content && j.encoding === 'base64') return { sha: j.sha, text: b64dec(j.content) };
+  const r2 = await gh(path, { raw: true }); if (!r2.ok) throw new Error(ghErr(r2));
+  return { sha: j.sha, text: await r2.text() };
+}
+async function shaOf(path) { const r = await gh(path); if (r.status === 404) return null; if (!r.ok) throw new Error(ghErr(r)); return (await r.json()).sha; }
+async function putFile(path, b64, sha, msg) {
+  for (let a = 0; a < 2; a++) {
+    const body = { message: msg || `Stiftblock-Sync ${new Date().toLocaleString('de-DE')} (${DEVICE})`, content: b64 };
+    if (sha) body.sha = sha;
+    const r = await gh(path, { method: 'PUT', body: JSON.stringify(body) });
+    if (r.ok) return (await r.json()).content.sha;
+    if ((r.status === 409 || r.status === 422) && a === 0) { sha = await shaOf(path); continue; }
+    throw new Error(ghErr(r));
+  }
+}
+async function delFile(path, sha) {
+  if (!sha) sha = await shaOf(path); if (!sha) return;
+  const r = await gh(path, { method: 'DELETE', body: JSON.stringify({ message: 'Stiftblock: gelöscht', sha }) });
+  if (!r.ok && r.status !== 404 && r.status !== 409 && r.status !== 422) throw new Error(ghErr(r));
+}
+
+/* ---- Abgleich ---- */
+function syncSchedule() { if (!syncOn()) return; clearTimeout(syT); syT = setTimeout(() => syncNow(), 15000); }
+async function seedVersions() { // vorhandene Notizen beim ersten Verbinden erfassen
+  for (const s of ['items', 'docs', 'blobs']) for (const id of await DB0.keys(s)) {
+    if (id === '__meta') continue; const k = SKEY[s] + ':' + id;
+    if (!SY.ver[k] && !SY.dead[k]) { const it = items.get(id); SY.ver[k] = (it && it.updated) || 1; }
+  }
+  sySave();
+}
+async function syncNow(opt = {}) {
+  if (!syncOn()) return false;
+  if (syBusy) return syBusy;
+  syBusy = (async () => {
+    clearTimeout(syT); setSy('sync');
+    try {
+      let libChanged = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const got = await getText(MANI);
+        const m = got ? JSON.parse(got.text) : { app: 'stiftblock-sync', v: 1, items: {}, docs: {}, blobs: {}, dead: {} };
+        for (const t of ['items', 'docs', 'blobs', 'dead']) m[t] = m[t] || {};
+        let mChanged = !got;
+        const openId = edOpen() && note ? note.id : null;
+        const keys = new Set([...Object.keys(SY.ver), ...Object.keys(SY.dead), ...Object.keys(m.dead)]);
+        for (const [t, tbl] of [['i', m.items], ['d', m.docs], ['b', m.blobs]]) for (const id in tbl) keys.add(t + ':' + id);
+        for (const k of keys) {
+          const t = k[0], id = k.slice(2), store = STORE[t], rtbl = m[store];
+          if (!store) continue;
+          const rv = rtbl[id] ? rtbl[id].t || 0 : 0, rd = m.dead[k] || 0, lv = SY.ver[k] || 0, ld = SY.dead[k] || 0;
+          const rT = Math.max(rv, rd), lT = Math.max(lv, ld);
+          if (rT === lT) continue;
+          if (rT > lT) { // neuer auf GitHub → herunterladen
+            if (openId === id) continue; // gerade geöffnete Notiz nicht unter den Fingern wegziehen
+            if (rd >= rv) {
+              await DB0.del(store, id).catch(() => {}); if (t === 'i') items.delete(id);
+              delete SY.ver[k]; SY.dead[k] = rd; libChanged = true;
+            } else {
+              let val;
+              if (t === 'i') val = rtbl[id].data;
+              else if (t === 'd') { const f = await getText(`docs/${id}.json`); if (!f) continue; val = JSON.parse(f.text); }
+              else { const r = await gh(`blobs/${id}`, { raw: true }); if (!r.ok) continue; val = { id, blob: new Blob([await r.arrayBuffer()], { type: rtbl[id].type || 'image/png' }) }; }
+              await DB0.put(store, val); if (t === 'i') items.set(id, val);
+              SY.ver[k] = rv; delete SY.dead[k]; libChanged = true;
+            }
+          } else { // neuer auf diesem Gerät → hochladen
+            if (ld >= lv) {
+              if (rtbl[id]) { if (t !== 'i') await delFile(t === 'd' ? `docs/${id}.json` : `blobs/${id}`, rtbl[id].sha); delete rtbl[id]; }
+              m.dead[k] = ld; mChanged = true;
+            } else {
+              const val = await DB0.get(store, id);
+              if (!val) { delete SY.ver[k]; continue; }
+              if (t === 'i') rtbl[id] = { t: lv, data: val };
+              else if (t === 'd') rtbl[id] = { t: lv, sha: await putFile(`docs/${id}.json`, b64enc(JSON.stringify(val)), rtbl[id] && rtbl[id].sha) };
+              else { const du = await blobToDataUrl(val.blob); rtbl[id] = { t: lv, type: val.blob.type, sha: await putFile(`blobs/${id}`, du.slice(du.indexOf(',') + 1), rtbl[id] && rtbl[id].sha, 'Stiftblock: Bild') }; }
+              delete m.dead[k]; mChanged = true;
+            }
+          }
+          sySave();
+        }
+        if (mChanged) {
+          m.saved = Date.now(); m.device = DEVICE;
+          const body = { message: `Stiftblock-Sync ${new Date().toLocaleString('de-DE')} (${DEVICE})`, content: b64enc(JSON.stringify(m)) };
+          if (got) body.sha = got.sha;
+          const r = await gh(MANI, { method: 'PUT', body: JSON.stringify(body) });
+          if (r.status === 409 || r.status === 422) continue; // inzwischen anderes Gerät → neu holen & abgleichen
+          if (!r.ok) throw new Error(ghErr(r));
+        }
+        break;
+      }
+      SY.last = Date.now(); sySave();
+      if (libChanged && !edOpen()) renderLib();
+      setSy('ok'); return true;
+    } catch (e) { setSy('err', e.message || 'Keine Verbindung'); return false; }
+    finally { syBusy = null; }
+  })();
+  return syBusy;
+}
+document.addEventListener('visibilitychange', () => {
+  if (!syncOn()) return;
+  if (document.hidden) syncNow({ quiet: true });
+  else if (!SY.last || Date.now() - SY.last > 30000) syncNow();
+});
+window.addEventListener('online', () => syncNow());
+
+/* ---- Einrichtung ---- */
+/* Beim ersten Verbinden: gleichnamige Ordner (z. B. „Schule“ von beiden Geräten) zusammenlegen */
+async function mergeSameFolders() {
+  let changedAny = false, again = true;
+  while (again) {
+    again = false;
+    const seen = new Map();
+    const folders = [...items.values()].filter(i => i.kind === 'folder').sort((a, b) => (a.created || 0) - (b.created || 0));
+    for (const f of folders) {
+      const key = (f.parent || '') + '|' + f.name.trim().toLowerCase();
+      const keep = seen.get(key);
+      if (!keep) { seen.set(key, f); continue; }
+      for (const c of [...items.values()].filter(i => i.parent === f.id)) { c.parent = keep.id; await DB.put('items', c); }
+      items.delete(f.id); await DB.del('items', f.id);
+      changedAny = again = true; break;
+    }
+  }
+  if (changedAny) renderLib();
+  return changedAny;
+}
+async function connectSync(o, r, t) {
+  if (!o || !r || !t) { toast('Bitte alle drei Felder ausfüllen.'); return false; }
+  const prev = { ...SY };
+  Object.assign(SY, { owner: o, repo: r, token: t }); setSy('sync');
+  try {
+    const rr = await gh(''); if (!rr.ok) throw new Error(ghErr(rr));
+    const info = await rr.json();
+    if (!info.private) {
+      const c = await dialog({ title: 'Achtung: öffentliches Repository', body: `<p>„${esc(o)}/${esc(r)}“ ist <b>öffentlich</b> – jeder könnte deine Notizen sehen. Bitte ein privates Repository verwenden.</p>`,
+        buttons: [{ k: 'cancel', label: 'Abbrechen', pri: 1 }, { k: 'ok', label: 'Trotzdem', danger: 1 }] });
+      if (c.k !== 'ok') throw new Error('Abgebrochen – bitte ein privates Repository verwenden');
+    }
+    await seedVersions(); sySave();
+    let ok = await syncNow();
+    if (ok && await mergeSameFolders()) ok = await syncNow();
+    if (ok) { toast('Verbunden – deine Notizen werden jetzt automatisch gesichert ✓', 3500); renderLib(); }
+    return ok;
+  } catch (e) { SY = Object.assign(prev, { ver: SY.ver, dead: SY.dead }); sySave(); setSy('err', e.message); toast(e.message, 4500); return false; }
+}
+async function openSync() {
+  if (syncOn()) {
+    const code = btoa(JSON.stringify({ sb: 1, o: SY.owner, r: SY.repo, t: SY.token }));
+    const r = await dialog({ title: 'Automatische Sicherung', wide: 1,
+      body: `<p id="syStatus">${syStatusHtml()}</p>
+        <p style="color:var(--muted);font-size:14px">Repository: <b>${esc(SY.owner)}/${esc(SY.repo)}</b> · jede Änderung wird nach ca. 15 Sekunden gesichert, beim Öffnen holt Stiftblock den neuesten Stand – auch von deinen anderen Geräten.</p>
+        <details style="margin-top:10px"><summary style="cursor:pointer;font-weight:600">Weiteres Gerät verbinden</summary>
+          <p style="font-size:14px;color:var(--muted)">Diesen Code auf dem anderen Gerät unter „Sicherung → Automatische Sicherung → Code einfügen“ einfügen.</p>
+          <input class="field" readonly value="${code}" onclick="this.select()"><p style="font-size:13px;color:var(--danger)">Enthält deinen Schlüssel – nicht teilen.</p></details>`,
+      buttons: [{ k: 'off', label: 'Trennen', danger: 1 }, { k: 'hist', label: 'Verlauf ↗' }, { k: 'cancel', label: 'Schließen' }, { k: 'now', label: 'Jetzt sichern', pri: 1 }] });
+    if (r.k === 'now') { if (await syncNow()) toast('Gesichert ✓'); }
+    if (r.k === 'hist') window.open(`https://github.com/${encodeURIComponent(SY.owner)}/${encodeURIComponent(SY.repo)}/commits`, '_blank', 'noopener');
+    if (r.k === 'off') {
+      const c = await dialog({ title: 'Sicherung trennen?', body: '<p>Die Notizen auf diesem Gerät und in GitHub bleiben erhalten – es wird nur nicht mehr automatisch gesichert.</p>',
+        buttons: [{ k: 'cancel', label: 'Abbrechen' }, { k: 'ok', label: 'Trennen', danger: 1 }] });
+      if (c.k === 'ok') { SY = { ver: {}, dead: {} }; sySave(); setSy('idle'); }
+    }
+    return;
+  }
+  const r = await dialog({ title: 'Automatische Sicherung einrichten', wide: 1,
+    body: `<p style="font-size:14px">Wie bei Formkurve: Deine Notizen landen automatisch in einem <b>privaten</b> GitHub-Repository und sind auf allen Geräten gleich.</p>
+      <ol style="font-size:14px;line-height:1.55;padding-left:20px;margin:8px 0 12px">
+        <li>Auf github.com ein neues <b>privates</b> Repository anlegen, z. B. <b>stiftblock-daten</b> (Haken bei „Add a README“ setzen).</li>
+        <li>Unter Settings → Developer settings → Fine-grained tokens deinen Schlüssel öffnen (oder einen neuen anlegen), bei <i>Repository access</i> zusätzlich <b>stiftblock-daten</b> auswählen und <i>Contents: Read and write</i> erlauben.</li>
+        <li>Hier eintragen – fertig.</li></ol>
+      <label style="font:600 13px var(--ui)">GitHub-Benutzername</label><input class="field" id="syO" value="${esc(SY.owner || 'jujuan912')}" autocapitalize="off" autocorrect="off">
+      <label style="font:600 13px var(--ui);display:block;margin-top:8px">Daten-Repository</label><input class="field" id="syR" value="${esc(SY.repo || 'stiftblock-daten')}" autocapitalize="off" autocorrect="off">
+      <label style="font:600 13px var(--ui);display:block;margin-top:8px">Schlüssel (beginnt mit github_pat_)</label><input class="field" id="syK" type="password" placeholder="github_pat_…" autocapitalize="off" autocorrect="off">
+      <details style="margin-top:12px"><summary style="cursor:pointer;font-weight:600">Code von einem anderen Gerät einfügen</summary><input class="field" id="syC" placeholder="Code einfügen" style="margin-top:6px"></details>
+      <p style="font-size:13px;color:var(--muted)">Der Schlüssel bleibt nur auf deinen Geräten gespeichert.</p>`,
+    buttons: [{ k: 'cancel', label: 'Abbrechen' }, { k: 'ok', label: 'Verbinden & sichern', pri: 1 }] });
+  if (r.k !== 'ok') return;
+  let o = r.el.querySelector('#syO').value.trim(), rp = r.el.querySelector('#syR').value.trim(), t = r.el.querySelector('#syK').value.trim();
+  const c = r.el.querySelector('#syC').value.trim();
+  if (c) { try { const j = JSON.parse(atob(c)); if (j.sb !== 1) throw 0; o = j.o; rp = j.r; t = j.t; } catch (e) { toast('Der Code ist ungültig.'); return; } }
+  busy('Verbinde mit GitHub …'); const ok = await connectSync(o, rp, t); busyEnd();
+  if (!ok) openSync();
+}
+
 /* ================= Start ================= */
 async function boot() {
   await openDB();
@@ -1966,6 +2212,8 @@ async function boot() {
   }
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
   renderLib();
+  $('syBtn').onclick = openSync; setSy('idle');
+  if (syncOn()) { await seedVersions(); syncNow(); }
   if (STANDALONE && 'serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('./sw.js').catch(() => {});
   if (STANDALONE && new URLSearchParams(location.search).has('share')) { history.replaceState(null, '', location.pathname); handleShared(); }
 }
